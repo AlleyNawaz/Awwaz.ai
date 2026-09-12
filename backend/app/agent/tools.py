@@ -63,6 +63,13 @@ class AgentTools:
         }
 
     @staticmethod
+    async def search_civic_knowledge(query: str) -> List[Dict[str, Any]]:
+        """Read-only (Exa AI): Retrieve grounded municipal documents and contact registries."""
+        from app.integrations.search.exa_adapter import ExaSearchAdapter
+        adapter = ExaSearchAdapter()
+        return await adapter.search_civic_directory(query)
+
+    @staticmethod
     async def create_case(
         session: AsyncSession,
         citizen_id: str,

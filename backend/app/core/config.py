@@ -34,12 +34,42 @@ class Settings(BaseModel):
     SESSION_COOKIE_NAME: str = os.getenv("SESSION_COOKIE_NAME", "awwaz_session")
     SESSION_MAX_AGE_SECONDS: int = int(os.getenv("SESSION_MAX_AGE_SECONDS", "86400"))
 
-    # AI Provider: "fixture", "gemini", "openai"
+    # AI Provider: "fixture", "gemini", "openai", "openrouter"
     LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "fixture")
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
     GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
     OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
+    OPENROUTER_MODEL: str = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+    OPENROUTER_BASE_URL: str = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+
+    # Neural Search & Knowledge Retrieval (Exa AI)
+    EXA_API_KEY: str = os.getenv("EXA_API_KEY", "")
+    EXA_BASE_URL: str = os.getenv("EXA_BASE_URL", "https://api.exa.ai")
+
+    # Identity & Access Management (Auth0)
+    AUTH0_DOMAIN: str = os.getenv("AUTH0_DOMAIN", "")
+    AUTH0_CLIENT_ID: str = os.getenv("AUTH0_CLIENT_ID", "")
+    AUTH0_CLIENT_SECRET: str = os.getenv("AUTH0_CLIENT_SECRET", "")
+    AUTH0_AUDIENCE: str = os.getenv("AUTH0_AUDIENCE", "")
+
+    # Durable Cloud Background Jobs (Trigger.dev)
+    TRIGGER_API_KEY: str = os.getenv("TRIGGER_API_KEY", "")
+    TRIGGER_PROJECT_ID: str = os.getenv("TRIGGER_PROJECT_ID", "")
+    TRIGGER_API_URL: str = os.getenv("TRIGGER_API_URL", "https://api.trigger.dev")
+
+    # Cloud Runtime & AI Platform (Google Cloud)
+    GOOGLE_CLOUD_PROJECT: str = os.getenv("GOOGLE_CLOUD_PROJECT", "")
+
+    # Operator Assistant & Copilot Framework (CopilotKit)
+    COPILOTKIT_PUBLIC_KEY: str = os.getenv("COPILOTKIT_PUBLIC_KEY", "")
+
+    # Open Source AI Safety & Alignment (Mozilla AI)
+    MOZILLA_AI_SAFETY_ENABLED: bool = os.getenv("MOZILLA_AI_SAFETY_ENABLED", "true").lower() in ("true", "1", "yes")
+
+    # Civic Intake Disambiguation (Ambiguous AI)
+    AMBIGUOUS_AI_CONFIDENCE_THRESHOLD: float = float(os.getenv("AMBIGUOUS_AI_CONFIDENCE_THRESHOLD", "0.75"))
 
     # Civic Service Adapter: "mock", "live"
     CIVIC_ADAPTER_TYPE: str = os.getenv("CIVIC_ADAPTER_TYPE", "mock")

@@ -188,6 +188,50 @@ Validates TypeScript compilation, static optimization, and route bundling with z
 
 ---
 
+## Hackathon Sponsors and Technology Integrations
+
+Awwaz was built for the AI Tinkerers Agents Everywhere Hackathon, leveraging leading ecosystem tools and sponsor platforms across its agentic workflow:
+
+- AI Tinkerers (@AITinkerers): Global community host for the Agents Everywhere Hackathon, inspiring the design of deterministic autonomous civic coordination.
+- OpenAI (@OpenAI): Multilingual entity extraction and structured JSON intent classification across Urdu, Roman Urdu, and English via GPT-4o.
+- CopilotKit (@CopilotKit): In-app agent copilot interaction framework powering the municipal operator review interface and human-in-the-loop validation flows.
+- OpenRouter (@openrouter): Unified multi-LLM model routing gateway providing intelligent fallback and model failover between proprietary and open-weight architectures.
+- Exa AI (@exaailabs): Neural knowledge retrieval and semantic search over municipal regulatory gazettes, departmental jurisdictions, and utility emergency contacts.
+- Auth0 (@auth0): Enterprise Single Sign-On (SSO), JWT token validation, and role-based access control (RBAC) separating citizen submissions from municipal operator approvals.
+- Ambiguous AI (@ambiguousio): Conversational ambiguity detection and confidence scoring, automatically triggering clarification prompts when reports lack critical landmarks or context.
+- Trigger.dev (@triggerdotdev): Durable cloud-native background execution engine for 72-hour SLA stall monitoring, recurring commitment reminders, and civic notification dispatches.
+- Mozilla AI (@mozillaAI): Open-source trustworthy AI evaluation framework enforcing grounded fact citations and deterministic escalation boundaries.
+- Google Cloud (@googlecloud): Cloud runtime infrastructure, Gemini multimodal vision inference for damage photo verification, and scalable deployment pipelines.
+
+---
+
+## Social Share and Submission Details
+
+### Twitter / X Submission Copy
+
+Built Awwaz for the @AITinkerers #AgentsEverywhere Hackathon!
+
+An enterprise-grade autonomous civic intelligence engine transforming multilingual citizen voice/text across Urdu, Roman Urdu, and English into verified municipal actions with SLA stall monitoring and SHA-256 audit ledgers.
+
+Demo: https://youtu.be/4NAGoNHyNrM
+Code: https://github.com/AlleyNawaz/Awwaz.ai
+
+Powered by:
+@OpenAI @CopilotKit @openrouter @exaailabs @auth0 @ambiguousio @triggerdotdev @mozillaAI @googlecloud
+
+### LinkedIn Submission Copy
+
+Excited to introduce Awwaz, built for the AI Tinkerers #AgentsEverywhere Hackathon!
+
+Traditional civic portals act as passive complaint inboxes where tickets get lost. Awwaz re-engineers municipal coordination into an active, autonomous loop: multilingual intake (Urdu, Roman Urdu, English), automated 72-hour SLA stall detection, human-in-the-loop consequential escalation boundaries, and sequential SHA-256 cryptographic audit ledgers.
+
+Watch the full walkthrough: https://youtu.be/4NAGoNHyNrM
+GitHub repository: https://github.com/AlleyNawaz/Awwaz.ai
+
+Built leveraging tools from AI Tinkerers, OpenAI, CopilotKit, OpenRouter, Exa, Auth0, Ambiguous AI, Trigger.dev, Mozilla.ai, and Google Cloud.
+
+---
+
 ## License
 
 MIT License. Developed for the autonomous civic intelligence ecosystem.
