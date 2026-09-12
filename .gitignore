@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+frontend/node_modules/
+backend/venv/
+venv/
+
+# Build artifacts
+.next/
+frontend/.next/
+build/
+dist/
+out/
+
+# Python & testing
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+*.egg-info/
+
+# Environment and databases
+.env
+*.db
+awwaz.db
+uploads/
+
+# Temporary video assets
+tools/
+video_frames/
+video_temp/
+*.mp4
+
+# Operating System
+.DS_Store
+Thumbs.db

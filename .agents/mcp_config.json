@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "exa": {
+      "serverUrl": "https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa,agent_run,web_search_advanced_exa",
+      "headers": {
+        "x-api-key": "50a07655-9cd0-47cb-a795-79ea1c679598"
+      }
+    }
+  }
+}
