@@ -62,6 +62,10 @@ Defaults chosen where the PRD left something open. Each can be overridden before
 | D10 | **Configuration in the database.** Departments, routing rules, escalation chain, and stall thresholds are DB tables seeded from `database/seed/*.yaml`. Prompts read them at runtime; nothing category-related is hard-coded in a prompt. | Appendix A: "The mapping must be configurable and not hard-coded in the prompt." | 2, 3 |
 | D11 | **Time:** all timestamps `timestamptz` in UTC. Seed data uses offsets relative to "now" (e.g. assigned 72 h ago) so demo data never goes stale. | §20 timezone rule; Appendix F describes seeds in relative terms. | 2+ |
 | D12 | **Rate limiting** is an in-memory token bucket applied in slice 6, not slice 1. | Needed for §16 but not for a working loop; keeping slice 1 lean. | 6 |
+| D13 | **Two idempotency keys.** The HTTP `Idempotency-Key` is per request and only replays the HTTP response. A separate `external_idempotency_key` is minted once per approval, stored on the recommendation, and sent to the adapter on every attempt, so a retry after an ambiguous timeout can never become a second external escalation. Adapters must dedupe on it; the mock does. | A timeout after the external system accepted the action is indistinguishable from a failure; only a stable key makes retry safe (A8, R6). | 4 |
+| D14 | **Leased, reconciled execution.** `EXECUTING` recommendations, `IN_FLIGHT` idempotency rows, and case reservations all carry lease expiries. A worker step re-drives an expired execution once with the same external key, then fails it for operator retry; the request path takes over an expired lease instead of returning 409 forever. Every adapter attempt is written as an `external_actions` row before the call. | A process restart between committing the approval and storing the response must not strand the approval. | 4 |
+| D15 | **Case reserved while an action executes.** Operator- and agent-initiated status transitions on a case with a live execution return 409 `CASE_RESERVED`; the reservation shares the execution lease so it cannot outlive a stranded execution. The success path applies `ESCALATED` under a row lock and records any residual mismatch as `RECONCILIATION_REQUIRED` rather than losing the external fact. | Slice 2's table allows `ESCALATION_PENDING → ASSIGNED/IN_PROGRESS/CLOSED`; without a reservation a concurrent operator change could diverge DB state from a completed external escalation. | 2, 4 |
+| D16 | **Chat evidence is staged per conversation.** `POST /conversations/{id}/evidence` stores a `STAGED` row (24 h TTL) whose ID the composer sends as `attachment_ids`; the server validates ownership and binds all staged files to the case when it is created. The model never supplies attachment IDs. A janitor deletes expired staged files. | §12's message body carries `attachment_ids` but the PRD's only upload endpoint needs a complaint ID that does not exist yet during intake. | 3, 6 |
 
 ## PRD acceptance matrix → slice
 
@@ -92,6 +96,7 @@ Defaults chosen where the PRD left something open. Each can be overridden before
 - **"Normalized location key" for recurrence is undefined.** Defined in slice 5.
 - **`LLM_API_KEY` → `ANTHROPIC_API_KEY`** (D1).
 - **Admin configuration (F22, P2)** is delivered read-only in slice 6. A write UI is out of MVP scope.
+- **§12's `attachment_ids` has no upload path before a case exists.** Resolved with per-conversation staged uploads (D16, slice 6).
 - **"Approval cannot be overridden by user text"**: enforced structurally. The LLM's tool registry never contains an execute/approve tool (slice 3), and the approval endpoint is operator-only (slice 4).
 
 ## How to proceed

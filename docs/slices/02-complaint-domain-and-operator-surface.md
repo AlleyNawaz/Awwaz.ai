@@ -21,7 +21,7 @@ Build the deterministic core with no AI involved: a complaint can be created fro
 - `complaints/transitions.py`: the transition table below, `assert_transition(current, target)` raising `INVALID_STATE_TRANSITION` (409), and `allowed_targets(current, actor_role)`.
 - `complaints/service.py`:
   - `create_complaint(db, actor, input) -> Complaint`: validates enums, assigns `reference` from sequence, routes via `RoutingService`, sets initial status `REPORTED` then auto-advances to `SUBMITTED` on successful routing (both events recorded), sets responsibility from department chain level 0, appends `COMPLAINT_CREATED` and `ROUTED` (or `REVIEW_REQUIRED`) events, records audit.
-  - `transition_status(db, actor, complaint_id, target, reason, expected_version)`: role check (OPERATOR/ADMIN/SERVICE), load `FOR UPDATE`, version check (→ 409 `CONFLICT`), transition check, increments `version`, appends `STATUS_CHANGED`, audit.
+  - `transition_status(db, actor, complaint_id, target, reason, expected_version)`: role check (OPERATOR/ADMIN/SERVICE), load `FOR UPDATE`, version check (→ 409 `CONFLICT`), reservation check (`policies.assert_not_reserved`, a hook that is a no-op until slice 4 adds execution reservations), transition check, increments `version`, appends `STATUS_CHANGED`, audit.
   - `add_note(db, actor, complaint_id, text)`: operator note → `NOTE_ADDED` progress event (gives operators a way to record real progress, used by the stall demo).
   - `get_visible_case(db, actor, complaint_id)`: citizens see only their own; others' cases return 404 `NOT_FOUND` (not 403) so existence is not leaked (§20, A11). Operators/admins see all.
   - `list_complaints(db, actor, filters, page, page_size)`: filters from §12 (`status, priority, department_id, category, stalled`) plus `citizen_id` implied for citizens.
@@ -46,7 +46,7 @@ RESOLVED            → CLOSED, IN_PROGRESS            (IN_PROGRESS = reopen)
 CLOSED              → (terminal)
 ```
 
-Actor rules: citizens never call the transition endpoint. `ESCALATION_PENDING → ESCALATED` is reserved for the escalation service (slice 4) and rejected for direct operator calls. `WAITING_FOR_CITIZEN → *` may also be triggered by the agent's `add_missing_information` tool (slice 3) acting as `ActorType.AGENT`.
+Actor rules: citizens never call the transition endpoint. `ESCALATION_PENDING → ESCALATED` is reserved for the escalation service (slice 4) and rejected for direct operator calls. `ESCALATION_PENDING → ASSIGNED | IN_PROGRESS | CLOSED` exist for the aftermath of a failed execution or a deliberate operator decision; while an approved action is actually executing, slice 4 reserves the case and `transition_status` rejects operator- and agent-initiated transitions with 409 `CASE_RESERVED` until the execution finishes or its lease expires (D15). `WAITING_FOR_CITIZEN → *` may also be triggered by the agent's `add_missing_information` tool (slice 3) acting as `ActorType.AGENT`.
 
 ### Event types and progress semantics
 
@@ -54,13 +54,13 @@ Actor rules: citizens never call the transition endpoint. `ESCALATION_PENDING �
 COMPLAINT_CREATED, ROUTED, REVIEW_REQUIRED, STATUS_CHANGED, ASSIGNED, NOTE_ADDED,
 INFORMATION_ADDED, COMMITMENT_CREATED, COMMITMENT_FULFILLED, COMMITMENT_MISSED,
 STALL_DETECTED, RECOMMENDATION_CREATED, RECOMMENDATION_APPROVED, RECOMMENDATION_REJECTED,
-EXTERNAL_ACTION_REQUESTED, EXTERNAL_ACTION_CONFIRMED, EXTERNAL_ACTION_FAILED,
-FOLLOW_UP_SENT, RECURRENCE_DETECTED, EVIDENCE_ADDED
+EXTERNAL_ACTION_REQUESTED, EXTERNAL_ACTION_CONFIRMED, EXTERNAL_ACTION_FAILED, EXTERNAL_ACTION_REDRIVEN,
+RECONCILIATION_REQUIRED, FOLLOW_UP_SENT, RECURRENCE_DETECTED, EVIDENCE_ADDED
 ```
 
 `PROGRESS_EVENT_TYPES` (what counts as the responsible party making progress, consumed by slice 4's stall detector):
 `STATUS_CHANGED` (except to `WAITING_FOR_CITIZEN`, which is waiting on the citizen), `ASSIGNED`, `NOTE_ADDED`, `COMMITMENT_CREATED`, `COMMITMENT_FULFILLED`, `EXTERNAL_ACTION_CONFIRMED`, `FOLLOW_UP_SENT`.
-Explicitly not progress: `STALL_DETECTED`, `RECOMMENDATION_*`, `EVIDENCE_ADDED` (citizen action), `INFORMATION_ADDED` (citizen action), `RECURRENCE_DETECTED`, `COMMITMENT_MISSED`.
+Explicitly not progress: `STALL_DETECTED`, `RECOMMENDATION_*`, `EXTERNAL_ACTION_REDRIVEN`, `RECONCILIATION_REQUIRED`, `EVIDENCE_ADDED` (citizen action), `INFORMATION_ADDED` (citizen action), `RECURRENCE_DETECTED`, `COMMITMENT_MISSED`.
 
 ### Configuration (`database/seed/`)
 
