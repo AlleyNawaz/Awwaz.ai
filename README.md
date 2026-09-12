@@ -221,7 +221,7 @@ Powered by:
 
 ### LinkedIn Submission Copy
 
-Excited to introduce Awwaz, built for the AI Tinkerers #AgentsEverywhere Hackathon!
+Excited to introduce Awwaz, built together with Asim Ghaffar (VP at 10Pearls) for the AI Tinkerers #AgentsEverywhere Hackathon!
 
 Traditional civic portals act as passive complaint inboxes where tickets get lost. Awwaz re-engineers municipal coordination into an active, autonomous loop: multilingual intake (Urdu, Roman Urdu, English), automated 72-hour SLA stall detection, human-in-the-loop consequential escalation boundaries, and sequential SHA-256 cryptographic audit ledgers.
 
