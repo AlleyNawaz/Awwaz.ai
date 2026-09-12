@@ -7,7 +7,7 @@ PRD coverage: F10 (stall detection), F11 (recommendation), F12 (human approval),
 
 ## Goal
 
-A background worker detects cases with no progress past a threshold, flags them, and creates exactly one evidence-backed recommendation per incident. An operator reviews the recommendation, approves it, and the server executes the action through a replaceable civic adapter with an idempotency key. The case only becomes `ESCALATED` when the adapter confirms. Everything lands in the timeline and audit log.
+A background worker detects cases with no progress past a threshold, flags them, and creates exactly one evidence-backed recommendation per incident. An operator reviews the recommendation, approves it, and the server executes the action through a replaceable civic adapter with a stable external idempotency key. The case only becomes `ESCALATED` when the adapter confirms. Interrupted executions are recovered, not stranded. Everything lands in the timeline and audit log.
 
 ## What this proves
 
@@ -17,7 +17,7 @@ The "wow factor" second half (§1): background event detection, the human approv
 
 ### Worker (`backend/app/workers/`)
 
-- `scheduler.py`: `python -m app.workers.scheduler` loop; interval `WORKER_INTERVAL_SECONDS` (default 30). Each tick runs `stall_detector.run()` then `commitment_checker.run()` (the latter is a no-op until slice 5). Each tick is one DB transaction per case; failures on one case are logged and do not stop the tick. Uses the seeded SERVICE actor for audit.
+- `scheduler.py`: `python -m app.workers.scheduler` loop; interval `WORKER_INTERVAL_SECONDS` (default 30). Each tick runs `stall_detector.run()`, `execution_reconciler.run()`, then `commitment_checker.run()` (the latter is a no-op until slice 5). Each tick is one DB transaction per case; failures on one case are logged and do not stop the tick. Uses the seeded SERVICE actor for audit.
 - `stall_detector.py`:
   - Eligible statuses: `SUBMITTED, ACKNOWLEDGED, ASSIGNED, IN_PROGRESS, ESCALATED`. Not eligible: `REPORTED` (not yet routed), `WAITING_FOR_CITIZEN` (waiting on the citizen), `ESCALATION_PENDING` (already under human decision), `RESOLVED`, `CLOSED`.
   - Threshold: `routing_rules.stall_threshold_hours` for the case's category, else `STALL_THRESHOLD_HOURS` (default 72).
@@ -27,34 +27,72 @@ The "wow factor" second half (§1): background event detection, the human approv
   - Incident key: `STALL:{complaint_id}:{last_progress_event_id}`. Same key on re-run → no new recommendation (A6, §20 "worker restart"). New progress then a new stall → new key → new recommendation.
   - Recommendation type rule (deterministic): `ESCALATE` if the case has a `MISSED` commitment (slice 5 populates this; empty until then) **or** `hours_since >= 2 × threshold` **or** status is `ESCALATED` and still stalled (escalate to the next chain level); otherwise `FOLLOW_UP`. A1024 (72 h, missed commitment in slice 5) → `ESCALATE` in the final demo; before slice 5 it yields `FOLLOW_UP` unless the threshold is set to 36 h, which the demo runbook documents.
   - Evidence JSON (what the operator sees, Flow D/E step 6): `last_progress_at`, `hours_since_progress`, `threshold_hours`, `status`, `department`, `responsibility_name`, `responsibility_level`, `missed_commitments[]`, `previous_escalations`.
+- `execution_reconciler.py`: recovers executions whose lease has expired. Specified under "Recovering interrupted executions" below.
 
 ### Escalation domain (`backend/app/domain/escalation/`)
 
 - `service.py`:
   - `is_eligible(complaint, now, threshold)` pure function.
   - `create_recommendation(db, complaint, type, reason, evidence, incident_key, requires_approval)`: insert-or-return-existing on the partial unique index; appends `RECOMMENDATION_CREATED`; `LINK_RECURRING` and `REQUEST_INFORMATION` (future) can be `requires_approval=false`; `FOLLOW_UP` and `ESCALATE` always require approval.
-  - `approve(db, actor, recommendation_id, comment, idempotency_key, expected_case_version)`: see approval flow below.
+  - `approve(db, actor, recommendation_id, comment, idempotency_key, expected_case_version)`: see approval flow below. Mints the recommendation's `external_idempotency_key` exactly once.
   - `reject(db, actor, recommendation_id, comment)`: `PENDING → REJECTED`, approval row with decision `REJECTED`, `RECOMMENDATION_REJECTED` event, audit.
-  - `retry(db, actor, recommendation_id, idempotency_key)`: `FAILED → EXECUTING` and re-run `execute` with the new key.
-  - `execute(db, recommendation)`: dispatch by type — `ESCALATE` → `adapter.escalate_case`, `FOLLOW_UP` → `adapter.request_follow_up`. Records an `external_actions` row per attempt.
-- `policies.py`: who may approve (OPERATOR, ADMIN; never CITIZEN, never AGENT, never the model), next chain level computation from `departments.escalation_chain`.
+  - `retry(db, actor, recommendation_id, idempotency_key)`: `FAILED → EXECUTING`, new attempt via `execute`. The HTTP `Idempotency-Key` only governs replay of this HTTP response; the adapter is always called with the recommendation's **stored** `external_idempotency_key`, so a retry after an ambiguous failure cannot produce a second external escalation.
+  - `execute(db, recommendation, actor)`: dispatch by type — `ESCALATE` → `adapter.escalate_case`, `FOLLOW_UP` → `adapter.request_follow_up`. Writes the `external_actions` attempt row **before** the adapter call and finalises it after (outbox-style record, so an interrupted attempt is visible).
+  - `reconcile_stale_executions(db, now)`: used by the worker and by the request path when a lease has expired.
+- `policies.py`: who may approve (OPERATOR, ADMIN; never CITIZEN, never AGENT, never the model); next chain level computation from `departments.escalation_chain`; `assert_not_reserved(complaint, actor_type, now)` used by slice 2's `transition_status` (see "Reserving the case during execution").
 
-### Approval flow (Flow F, server-side, single transaction around state, adapter call outside the lock)
+### Two idempotency keys (D13)
+
+| Key | Minted | Scope | Purpose |
+|---|---|---|---|
+| HTTP `Idempotency-Key` | by the client, once per dialog open / retry click | one HTTP request and its replays | return the same HTTP response for a repeated request; detect concurrent duplicates |
+| `external_idempotency_key` | by the server at approval, `awwaz-{recommendation_id}-{approval_id}` | the recommendation's external action, across **every** attempt | let the external system dedupe: a retry after a timeout must never be a second escalation |
+
+The external key is stored on `recommendations` and is immutable once set. Every `external_actions` row for that recommendation carries the same key with an incrementing `attempt`.
+
+### Approval flow (Flow F, server-side; state committed before the adapter call, adapter call outside any DB lock)
 
 1. `require_roles(OPERATOR, ADMIN)`.
-2. `Idempotency-Key` header required (400 `VALIDATION_ERROR` if absent). Look up `(key, actor_id, route)`: completed → replay stored response with `meta.idempotent_replay=true`; in flight → 409 `CONFLICT`.
+2. `Idempotency-Key` header required (400 `VALIDATION_ERROR` if absent). Look up `(key, actor_id, route)`:
+   - `COMPLETED` → replay the stored response with `meta.idempotent_replay=true`.
+   - `IN_FLIGHT` with an unexpired lease → 409 `CONFLICT` with `Retry-After` (a concurrent duplicate, e.g. a double click racing the first request).
+   - `IN_FLIGHT` with an expired lease → treat as a resume: run `reconcile_stale_executions` for the linked recommendation inline, then return its current state with `meta.recovered=true` (200). The key is never a permanent 409.
+   - `ABANDONED` (the reconciler got there first) → same as the resume case.
+   - Absent → insert `IN_FLIGHT` with `lease_expires_at = now + IDEMPOTENCY_LEASE_SECONDS` (default 90) and continue.
 3. Lock the recommendation row (`FOR UPDATE`). Must be `PENDING`, else 409 `ACTION_ALREADY_EXECUTED` (§20 "stale approval").
 4. If `expected_case_version` supplied and differs → 409 `CONFLICT`.
-5. Insert `approvals` row (decision `APPROVED`, comment). Recommendation `APPROVED → EXECUTING`. Append `RECOMMENDATION_APPROVED`. For `ESCALATE`: transition case to `ESCALATION_PENDING` via slice 2's `transition_status` as `ActorType.SYSTEM` (D9). Commit.
-6. Call the adapter with `timeout=CIVIC_ADAPTER_TIMEOUT_SECONDS` (default 5), `request_id`, and the idempotency key as `external_idempotency_key`. Append `EXTERNAL_ACTION_REQUESTED`.
-7. Success → `external_actions` row (`SUCCEEDED`, external reference), recommendation `EXECUTED`, `EXTERNAL_ACTION_CONFIRMED` event (progress), for `ESCALATE`: case `ESCALATION_PENDING → ESCALATED`, `responsibility_level += 1`, `responsibility_name` = next chain role, `stalled=false`; for `FOLLOW_UP`: `FOLLOW_UP_SENT` event (progress), `stalled=false`. Audit `RECOMMENDATION_EXECUTED` with result.
-8. Failure/timeout → `external_actions` row (`FAILED`, error class), recommendation `FAILED`, `EXTERNAL_ACTION_FAILED` event, case status unchanged from step 5 (`ESCALATION_PENDING` for escalations, per D9; never `ESCALATED` — A9). Audit with `result=FAILURE`. Response is 200 with `data.recommendation.status="FAILED"` and the §19 message "The action was not confirmed, so the case status was not changed", because the approval itself succeeded and was recorded.
-9. Store the final response body against the idempotency key.
+5. In one transaction: insert `approvals` row (decision `APPROVED`, comment); mint `external_idempotency_key`; recommendation `PENDING → EXECUTING` with `execution_lease_expires_at = now + EXECUTION_LEASE_SECONDS` (default `2 × CIVIC_ADAPTER_TIMEOUT_SECONDS + 30`, i.e. 40 s) and `execution_attempts = 1`; link the idempotency row to the recommendation; append `RECOMMENDATION_APPROVED`; **reserve the case** (`complaints.execution_lock_recommendation_id`, `execution_lock_expires_at` = same lease); for `ESCALATE`: transition case to `ESCALATION_PENDING` via slice 2's `transition_status` as `ActorType.SYSTEM` (D9). Commit.
+6. Insert `external_actions` row (`status=PENDING`, `attempt=1`, the external key, `request_id`). Commit. Call the adapter with `timeout=CIVIC_ADAPTER_TIMEOUT_SECONDS` (default 5), `request_id`, and `external_idempotency_key`. Append `EXTERNAL_ACTION_REQUESTED`.
+7. Success → in one transaction, **locking the complaint row**: `external_actions` row → `SUCCEEDED` with the external reference; recommendation → `EXECUTED`; clear the reservation; append `EXTERNAL_ACTION_CONFIRMED` (progress). For `ESCALATE`: if the case is still `ESCALATION_PENDING` → `ESCALATED`, `responsibility_level += 1`, `responsibility_name` = next chain role, `stalled=false`. If the case is **not** `ESCALATION_PENDING` (only reachable after a lease expiry released the reservation and an operator moved the case before a late success arrived): leave the status as the operator set it, append `RECONCILIATION_REQUIRED` with both facts (external reference, current status, who changed it), and raise an operator notification (slice 6). External reality is recorded truthfully either way. For `FOLLOW_UP`: `FOLLOW_UP_SENT` event (progress), `stalled=false`. Audit `RECOMMENDATION_EXECUTED` with result.
+8. Failure → classify: `REJECTED` (the adapter returned a definitive refusal), `TIMEOUT` or `TRANSPORT` (ambiguous: the external system may have accepted the action). `external_actions` row → `FAILED` with `error_class`; recommendation → `FAILED`; clear the reservation; append `EXTERNAL_ACTION_FAILED`; case status unchanged from step 5 (`ESCALATION_PENDING` for escalations, per D9; never `ESCALATED` — A9). Audit with `result=FAILURE`. Response is 200 with `data.recommendation.status="FAILED"`, `error_class`, and the §19 message "The action was not confirmed, so the case status was not changed", because the approval itself succeeded and was recorded.
+9. Store the final response body against the idempotency key (`COMPLETED`).
+
+### Recovering interrupted executions (D14)
+
+The process can die between step 5 and step 9 (deploy, crash, OOM). Without recovery the recommendation would sit in `EXECUTING` forever, the case would stay reserved, the same HTTP key would return 409 forever, and a fresh key would hit `ACTION_ALREADY_EXECUTED`. Leases plus a reconciler bound every one of those.
+
+- Leases: `recommendations.execution_lease_expires_at` and `idempotency_keys.lease_expires_at` are set when work starts and refreshed on each attempt. Nothing is ever considered stuck before its lease expires.
+- `execution_reconciler.run(now)` (worker step, every tick; also invoked inline by the request path in step 2): for each recommendation `EXECUTING` with an expired lease:
+  1. Mark the `PENDING` `external_actions` row `INTERRUPTED` (its outcome is unknown; the adapter may or may not have received it).
+  2. If `execution_attempts <= MAX_AUTO_REDRIVES + 1` (default `MAX_AUTO_REDRIVES=1`, i.e. one automatic re-drive beyond the operator's original attempt): re-run `execute` as the SERVICE actor with the **same** external key, a fresh lease, and `attempt + 1`. Append `EXTERNAL_ACTION_REDRIVEN`. The human already approved; completing the approved action is a system responsibility, and the stable external key makes the re-drive safe.
+  3. Otherwise: recommendation → `FAILED` (`error_class=INTERRUPTED`), `EXTERNAL_ACTION_FAILED`, reservation cleared, operator notification (slice 6). The operator's Retry button is available and safe for the same reason.
+  4. Mark the linked idempotency row `ABANDONED` if still `IN_FLIGHT`, so a replay of that key returns the recommendation's current state rather than a conflict.
+- Frontend: if the approve request fails at the transport level (no HTTP response), `ApprovalDialog` polls `GET /recommendations/{id}` until the status leaves `EXECUTING` (bounded by the lease) instead of reporting failure. A network blip is not shown as "not confirmed" until the server says so.
+
+### Reserving the case during execution (D15)
+
+Slice 2's state machine lets operators move `ESCALATION_PENDING → ASSIGNED | IN_PROGRESS | CLOSED`. Those transitions exist for the aftermath of a `FAILED` execution or a deliberate operator decision, but if one lands **while** the adapter is executing, a successful external escalation could arrive to a case that is no longer `ESCALATION_PENDING`. The reservation closes that window; the step 7 fallback covers the residue.
+
+- Step 5 sets `complaints.execution_lock_recommendation_id` and `execution_lock_expires_at` (same lease as the execution). Step 7, step 8, and the reconciler clear them.
+- Slice 2's `transition_status` calls `policies.assert_not_reserved(complaint, actor_type, now)`: an operator- or agent-initiated transition on a case with an unexpired reservation → 409 `CONFLICT`, code `CASE_RESERVED`, message "An approved action is executing on this case. Try again in a moment." `SYSTEM` transitions (the escalation service itself) are exempt. Notes, commitments, and evidence are not blocked; only status transitions are.
+- Because the reservation shares the execution lease, a stranded execution can freeze a case for at most one lease before the reconciler releases it.
+- Case DTO exposes `executing_recommendation_id` (null when not reserved); the operator status control is disabled with the same explanation while it is set. Dashboard queue shows an "executing" indicator on the row.
+- Step 7 applies `ESCALATION_PENDING → ESCALATED` under a `FOR UPDATE` lock on the complaint row, so even a transition that slips in after lease expiry is serialised with the success write and the `RECONCILIATION_REQUIRED` branch sees a consistent state.
 
 ### Civic adapter (`backend/app/integrations/civic/`)
 
-- `interface.py`: `CivicServiceAdapter` protocol with `submit_case`, `request_follow_up`, `escalate_case` (§18 contract), typed inputs/results (`external_reference`, `accepted_at`, `message`), `CivicAdapterError`, `CivicAdapterTimeout`.
-- `mock.py`: `MockCivicServiceAdapter` — deterministic. Reference format `MOCK-ESC-{sha1(external_idempotency_key)[:8]}` so replays return the same reference. Simulated latency `CIVIC_MOCK_LATENCY_MS` (default 400). Failure control: `CIVIC_MOCK_MODE=success|timeout|error` globally, and a per-case override when `location_text` contains the token `[[fail]]` (test and demo hook, documented in the runbook). Keeps an in-memory log of received requests so tests can assert exactly-once (A8).
+- `interface.py`: `CivicServiceAdapter` protocol with `submit_case`, `request_follow_up`, `escalate_case` (§18 contract). Every side-effecting input carries a required `external_idempotency_key` and `request_id`; results carry `external_reference`, `accepted_at`, `message`, `duplicate: bool` (true when the adapter recognised the key). Exceptions: `CivicAdapterRejected` (definitive refusal), `CivicAdapterTimeout`, `CivicAdapterUnavailable` (both ambiguous). Adapter authors are required to dedupe on the key; the contract says so in the docstring and the mock demonstrates it.
+- `mock.py`: `MockCivicServiceAdapter` — deterministic. Reference format `MOCK-ESC-{sha1(external_idempotency_key)[:8]}` so a repeated key returns the same reference with `duplicate=true`. Simulated latency `CIVIC_MOCK_LATENCY_MS` (default 400). Failure control: `CIVIC_MOCK_MODE=success|timeout|error` globally, and a per-case override when `location_text` contains the token `[[fail]]` (test and demo hook, documented in the runbook). `timeout` mode models the ambiguous case faithfully: it **records the request, then raises** `CivicAdapterTimeout`, so a later attempt with the same key is a duplicate, not a new action. `error` mode raises `CivicAdapterRejected`. Keeps an in-memory log exposing `requests()` and `unique_actions()` so tests can assert exactly-once (A8) across retries.
 - `factory.py`: `CIVIC_ADAPTER=mock` (only value for MVP); `CIVIC_SERVICE_BASE_URL` reserved for the future HTTP adapter (§27).
 
 ### Persistence (revision `0004_recommendations`)
@@ -62,49 +100,60 @@ The "wow factor" second half (§1): background event detection, the human approv
 ```text
 recommendations   id UUID PK, complaint_id FK, type, status (PENDING|APPROVED|REJECTED|EXECUTING|EXECUTED|FAILED|SUPERSEDED),
                   reason TEXT, evidence JSONB, requires_approval BOOL, incident_key VARCHAR, created_by_actor_type,
+                  external_idempotency_key VARCHAR UNIQUE NULL,      -- minted once at approval, immutable
+                  execution_lease_expires_at TIMESTAMPTZ NULL, execution_attempts INT DEFAULT 0,
                   created_at, updated_at
                   UNIQUE (incident_key) WHERE status IN ('PENDING','APPROVED','EXECUTING','FAILED')   -- "unique within active state"
-                  index (status), (complaint_id)
+                  index (status), (complaint_id), (status, execution_lease_expires_at)
 approvals         id UUID PK, recommendation_id FK, approver_id FK users, decision (APPROVED|REJECTED), reason TEXT,
                   case_version_at_decision INT, created_at
 external_actions  id UUID PK, recommendation_id FK, complaint_id FK, action_type, adapter, external_idempotency_key,
-                  status (SUCCEEDED|FAILED), external_reference NULL, error_code NULL, request_id, latency_ms, created_at
-idempotency_keys  key VARCHAR, actor_id UUID, route VARCHAR, status (IN_FLIGHT|COMPLETED), response_status INT NULL,
+                  attempt INT, status (PENDING|SUCCEEDED|FAILED|INTERRUPTED),
+                  error_class (REJECTED|TIMEOUT|TRANSPORT|INTERRUPTED) NULL, external_reference NULL,
+                  request_id, initiated_by_actor_type, started_at, finished_at NULL, latency_ms NULL
+                  UNIQUE (recommendation_id, attempt)
+idempotency_keys  key VARCHAR, actor_id UUID, route VARCHAR, status (IN_FLIGHT|COMPLETED|ABANDONED),
+                  recommendation_id UUID NULL, lease_expires_at TIMESTAMPTZ, response_status INT NULL,
                   response_body JSONB NULL, created_at, completed_at NULL
-                  PRIMARY KEY (key, actor_id, route)
+                  PRIMARY KEY (key, actor_id, route); index (status, lease_expires_at)
+complaints        + execution_lock_recommendation_id UUID FK recommendations NULL, + execution_lock_expires_at TIMESTAMPTZ NULL
 ```
+
+New event types (added to slice 2's list): `EXTERNAL_ACTION_REDRIVEN`, `RECONCILIATION_REQUIRED` (both non-progress).
 
 ### API
 
 | Method | Path | Auth | Notes |
 |---|---|---|---|
 | GET | `/api/v1/recommendations` | OPERATOR, ADMIN | filters `status, type, complaint_id` (§12) |
-| GET | `/api/v1/recommendations/{id}` | OPERATOR, ADMIN | with evidence, approvals, external actions, current case version |
+| GET | `/api/v1/recommendations/{id}` | OPERATOR, ADMIN | with evidence, approvals, all `external_actions` attempts, current case version, lease state |
 | POST | `/api/v1/recommendations/{id}/approve` | OPERATOR, ADMIN | `Idempotency-Key` header; body `{comment, expected_case_version?}` |
 | POST | `/api/v1/recommendations/{id}/reject` | OPERATOR, ADMIN | `{comment}` |
-| POST | `/api/v1/recommendations/{id}/retry` | OPERATOR, ADMIN | `Idempotency-Key` header; only from `FAILED` |
+| POST | `/api/v1/recommendations/{id}/retry` | OPERATOR, ADMIN | `Idempotency-Key` header; only from `FAILED`; reuses the stored external key |
 | GET | `/api/v1/dashboard/stalled` | OPERATOR, ADMIN | stalled cases with hours since progress and open recommendation |
-| POST | `/api/v1/admin/demo/run-worker` | ADMIN | demo mode only; runs one tick synchronously and returns what it did |
+| POST | `/api/v1/admin/demo/run-worker` | ADMIN | demo mode only; runs one tick synchronously (detector, reconciler, checker) and returns what it did |
 
-`GET /complaints/{id}` now fills the `recommendations` array. `dashboard/summary` now counts `stalled` and `pending_approval`; the queue's first two tiers become live.
+`GET /complaints/{id}` now fills the `recommendations` array and exposes `executing_recommendation_id`. `dashboard/summary` now counts `stalled` and `pending_approval`; the queue's first two tiers become live.
 
 ### Frontend
 
 - `/dashboard/approvals`: list of `RecommendationCard`s (type, case reference and title, reason, key evidence figures, age). Empty state: "No recommendations waiting for a decision."
-- `ApprovalDialog` (§10 "Approval modal"): title "Approve escalation?" / "Approve follow-up?", an explicit action statement ("Awwaz will send an escalation to Department Coordinator, Electrical & Street Lighting via the civic service adapter"), evidence block (case age, last progress, commitment status), Approve / Reject / Cancel. Generates one idempotency key when the dialog opens; the approve button disables on first click (§20 "double approval click"); on 409 shows the refresh prompt; on `FAILED` shows the truthful message and a Retry control.
-- Case detail: Recommendations section with the same card and controls; a stalled badge in the header; the timeline renders approval, external action requested/confirmed/failed, and status events with distinct icons plus text.
-- Dashboard: Stalled and Pending Approval counters live; queue tiers 1–2 populated; `/dashboard/activity` shows the recent audit log for OPERATOR/ADMIN (read-only, this is the first real content for that route).
+- `ApprovalDialog` (§10 "Approval modal"): title "Approve escalation?" / "Approve follow-up?", an explicit action statement ("Awwaz will send an escalation to Department Coordinator, Electrical & Street Lighting via the civic service adapter"), evidence block (case age, last progress, commitment status), Approve / Reject / Cancel. Generates one HTTP idempotency key when the dialog opens; the approve button disables on first click (§20 "double approval click"); on 409 shows the refresh prompt; on transport failure polls the recommendation until it leaves `EXECUTING`; on `FAILED` shows the truthful message, the `error_class`, and a Retry control. For ambiguous classes the copy says "The department system may already have received this. Retrying is safe: Awwaz reuses the same action key."
+- Case detail: Recommendations section with the same card and controls, including the attempt history; a stalled badge in the header; the status control disabled with the reservation message while an action is executing; the timeline renders approval, action requested/confirmed/failed/re-driven, reconciliation-required, and status events with distinct icons plus text.
+- Dashboard: Stalled and Pending Approval counters live; queue tiers 1–2 populated with an "executing" indicator where applicable; `/dashboard/activity` shows the recent audit log for OPERATOR/ADMIN (read-only, this is the first real content for that route).
 
 ## Out of scope (deferred)
 
-Commitments and missed-commitment evidence (5). Notifications on execution (6). Rate limits (6). Real external adapter (future).
+Commitments and missed-commitment evidence (5). Notifications on execution and on reconciliation-required (6; the events and hooks exist here). Rate limits (6). Real external adapter (future).
 
 ## Key rules and invariants
 
-- The worker never changes complaint `status`; it only sets `stalled`, appends events, and creates recommendations.
-- Only the escalation service performs `ESCALATION_PENDING → ESCALATED`, and only after an adapter success result.
-- The adapter is invoked at most once per idempotency key (A8). Replays return the stored response and do not touch the adapter.
-- A `FAILED` recommendation is retryable; a retry is a new adapter attempt with a new key, and every attempt is a row in `external_actions`.
+- The worker never changes complaint `status`; it only sets `stalled`, appends events, creates recommendations, and re-drives or fails stranded executions.
+- Only the escalation service performs `ESCALATION_PENDING → ESCALATED`, and only after an adapter success result, under a lock on the complaint row.
+- One external key per approved recommendation, for life. The adapter sees the same key on every attempt, so the external action happens at most once per approval regardless of retries, re-drives, or replays (A8).
+- Every adapter attempt is an `external_actions` row written before the call; no attempt is invisible.
+- `EXECUTING`, `IN_FLIGHT`, and the case reservation are all leased; none can outlive its lease without the reconciler acting on it.
+- A `FAILED` recommendation is retryable; a retry is a new attempt row with the same external key.
 - The LLM has no path to any endpoint or tool in this slice. Approval is an HTTP endpoint behind operator roles only.
 
 ## Tests
@@ -113,33 +162,42 @@ Unit:
 - `is_eligible`: 71 h → false, 72 h → true, `WAITING_FOR_CITIZEN` → false, `RESOLVED` → false; per-category threshold overrides global.
 - Recommendation type rule: 72 h no commitment → `FOLLOW_UP`; 150 h → `ESCALATE`; already `ESCALATED` and stalled → `ESCALATE` to the next level.
 - Incident key stability across runs; new progress produces a new key.
-- Mock adapter: same key → same reference; `[[fail]]` → error; `timeout` mode raises `CivicAdapterTimeout`.
+- Mock adapter: same key → same reference and `duplicate=true`; `[[fail]]` → timeout; `timeout` mode records the request then raises `CivicAdapterTimeout`; `error` mode raises `CivicAdapterRejected`.
+- `assert_not_reserved`: unexpired lock blocks OPERATOR and AGENT, allows SYSTEM; expired lock blocks nobody.
 
 Integration (real Postgres, mock adapter):
 - A6: seed A1024 at 73 h; run the detector twice → `stalled=true`, exactly one `PENDING` recommendation, one `STALL_DETECTED` event.
 - Progress resumes (operator note) → next tick clears `stalled`, marks the recommendation `SUPERSEDED`.
 - A8 / US-12: approve twice with the same `Idempotency-Key` → adapter log shows one call; second response has `idempotent_replay=true`.
 - Concurrent approvals with different keys → one succeeds, the other 409 `ACTION_ALREADY_EXECUTED`.
-- A9 / Flow I: `CIVIC_MOCK_MODE=timeout` → recommendation `FAILED`, `external_actions` row `FAILED`, case `ESCALATION_PENDING` not `ESCALATED`, `EXTERNAL_ACTION_FAILED` event present; retry in success mode → `EXECUTED`, `ESCALATED`, responsibility level incremented.
+- **Ambiguous retry is exactly-once**: `CIVIC_MOCK_MODE=timeout` → recommendation `FAILED` with `error_class=TIMEOUT`, case `ESCALATION_PENDING`; switch to `success`, retry with a new HTTP key → `EXECUTED`, `ESCALATED`, and `unique_actions()` on the mock shows **one** external action whose reference equals the first attempt's; two `external_actions` rows with the same external key and attempts 1 and 2.
+- A9 / Flow I: as above, asserting after the first attempt that the case is `ESCALATION_PENDING` not `ESCALATED` and `EXTERNAL_ACTION_FAILED` is present.
+- **Interrupted execution is recovered**: a test hook aborts the request after step 5 commits and before the adapter call (lease set to 1 s). Next reconciler run → the `PENDING` attempt is `INTERRUPTED`, a second attempt is made with the same external key, `EXTERNAL_ACTION_REDRIVEN` present, recommendation `EXECUTED`. Same scenario with the adapter unavailable → recommendation `FAILED` (`error_class=INTERRUPTED`), reservation cleared, Retry succeeds when the adapter recovers.
+- **Stranded HTTP key is not a permanent 409**: after the interrupted scenario, replaying the original `Idempotency-Key` returns 200 with the current recommendation state and `meta.recovered=true`; before the lease expires it returns 409 with `Retry-After`.
+- **Reservation**: while a recommendation is `EXECUTING` (adapter latency raised to exceed the test's timing), Sara's `PATCH /complaints/{id}/status` → 409 `CASE_RESERVED`; after completion the same PATCH succeeds; the SYSTEM transition inside step 7 is unaffected.
+- **Race fallback**: force lease expiry, let the reconciler release the reservation, move the case `ESCALATION_PENDING → IN_PROGRESS` as Sara, then deliver a late adapter success for attempt 1 → recommendation `EXECUTED`, `EXTERNAL_ACTION_CONFIRMED` present, status remains `IN_PROGRESS`, `RECONCILIATION_REQUIRED` event present with both facts.
 - US-07: Hamza calling approve → 403; missing `Idempotency-Key` → 400.
 - Stale `expected_case_version` → 409 `CONFLICT`, nothing changed.
-- A10: after an approval, `audit_logs` has `RECOMMENDATION_APPROVED` and `RECOMMENDATION_EXECUTED` rows with actor, resource, request_id, result.
+- A10: after an approval, `audit_logs` has `RECOMMENDATION_APPROVED` and `RECOMMENDATION_EXECUTED` rows with actor, resource, request_id, result; re-drives are audited as the SERVICE actor.
 - `run-worker` endpoint is 404 outside demo mode and 403 for OPERATOR.
 
 ## Definition of done
 
 - [ ] With seeds loaded, one worker tick flags A1024 as stalled and creates one recommendation; a second tick creates nothing new.
 - [ ] Sara opens Approvals, sees the recommendation with evidence, approves it, and within a few seconds the case detail shows `ESCALATED`, the new responsibility role, and timeline entries for approval → action requested → action confirmed (with the mock external reference).
-- [ ] With `CIVIC_MOCK_MODE=timeout`, the same approval shows the truthful failure state, the case stays `ESCALATION_PENDING`, and Retry (after switching the mode back) completes it.
+- [ ] With `CIVIC_MOCK_MODE=timeout`, the same approval shows the truthful failure state with `error_class=TIMEOUT`, the case stays `ESCALATION_PENDING`, and Retry (after switching the mode back) completes it with the **same** external reference the mock would have issued the first time.
+- [ ] Killing the backend between approval and adapter response leaves the recommendation recoverable: the next worker tick completes or fails it, and the case is not stuck reserved.
+- [ ] While an action is executing, the operator status control is disabled with an explanation and the API rejects transitions with `CASE_RESERVED`.
 - [ ] Double-clicking Approve produces exactly one external action.
 - [ ] All tests above pass; `make check` green; CI green.
 
 ## Demo checkpoint
 
-Scenes 4–7 (§32): open stalled A1024 → worker has flagged it → recommendation with evidence → operator approves → mock adapter confirms → timeline shows approval, action, and confirmed result. Appendix G's adapter-failure backup is demonstrable with one environment variable.
+Scenes 4–7 (§32): open stalled A1024 → worker has flagged it → recommendation with evidence → operator approves → mock adapter confirms → timeline shows approval, action, and confirmed result. Appendix G's adapter-failure backup is demonstrable with one environment variable, and the retry visibly reuses the same action key.
 
 ## Risks and notes
 
-- R6/R7 (duplicate side effect, unauthorised escalation) are addressed structurally here; both have dedicated tests.
-- Holding a DB lock across the adapter call would serialise all approvals behind a slow external system; the flow commits the approval first and calls the adapter outside the lock, which is why `EXECUTING` exists as a status.
-- `SUPERSEDED` is an addition to the PRD's `RecommendationStatus` enum, needed so a resolved stall does not leave a misleading `PENDING` recommendation in the queue.
+- R6/R7 (duplicate side effect, unauthorised escalation) are addressed structurally here; both have dedicated tests, including the ambiguous-timeout retry path.
+- Holding a DB lock across the adapter call would serialise all approvals behind a slow external system; the flow commits the approval first and calls the adapter outside the lock, which is why `EXECUTING` exists as a status. The cost of that choice is the recovery and reservation machinery above, which is deliberately bounded by one lease.
+- `SUPERSEDED` is an addition to the PRD's `RecommendationStatus` enum, needed so a resolved stall does not leave a misleading `PENDING` recommendation in the queue. `INTERRUPTED` on `external_actions` and `ABANDONED` on idempotency keys are likewise additions, needed so an interrupted process leaves an honest record.
+- Automatic re-drive is limited to one attempt so a persistently failing adapter surfaces to a human quickly rather than retrying in the background indefinitely.

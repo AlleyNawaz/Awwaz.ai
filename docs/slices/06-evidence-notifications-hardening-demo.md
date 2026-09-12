@@ -17,10 +17,18 @@ Close the remaining P1 features (evidence, notifications), apply the security co
 
 ### Evidence (F15)
 
-- `integrations/storage/interface.py`: `StorageService` with `put(key, stream, mime) -> StoredObject`, `open(key) -> stream`, `delete(key)`, `exists(key)`. `local.py`: `LocalDiskStorage` rooted at `STORAGE_LOCAL_PATH` (default `backend/var/evidence`, git-ignored). S3-compatible implementation is a documented follow-up using the same interface (D6). `factory.py` selects by `STORAGE_BACKEND=local|s3`.
-- `domain/evidence/service.py`: `attach(db, actor, complaint_id, upload)`: owner or OPERATOR/ADMIN; validation before any persistence (§20 "too large"): MIME allow-list `image/jpeg, image/png, image/webp` verified by magic bytes as well as declared type; size ≤ `EVIDENCE_MAX_BYTES` (default 5 MiB); ≤ `EVIDENCE_MAX_PER_CASE` (default 5); server-generated storage key `evidence/{complaint_id}/{uuid}.{ext}` (never the client filename); SHA-256 recorded; `EVIDENCE_ADDED` event (non-progress); audit. `get(db, actor, evidence_id)` enforces the same visibility as the case (A11 for files).
-- API: `POST /api/v1/complaints/{id}/evidence` (multipart, field `file`), `GET /api/v1/evidence/{id}` (streams the object with `Content-Disposition: inline`, correct MIME, `Cache-Control: private`). Errors: `VALIDATION_ERROR` for type/size/count, `STORAGE_FAILURE` (503) if the backend write fails, with no `evidence` row written.
-- Frontend: `EvidenceUploader` in the chat composer attachment action and on both case views (citizen: own case only; operator: any). Client-side pre-checks for size/type mirror the server rules but the server remains authoritative. Evidence section on case detail with thumbnails and alt text derived from the case title (§10 accessibility).
+- `integrations/storage/interface.py`: `StorageService` with `put(key, stream, mime) -> StoredObject`, `open(key) -> stream`, `move(old_key, new_key)`, `delete(key)`, `exists(key)`. `local.py`: `LocalDiskStorage` rooted at `STORAGE_LOCAL_PATH` (default `backend/var/evidence`, git-ignored). S3-compatible implementation is a documented follow-up using the same interface (D6). `factory.py` selects by `STORAGE_BACKEND=local|s3`.
+- `domain/evidence/service.py`:
+  - Shared validation, run before any persistence (§20 "too large"): MIME allow-list `image/jpeg, image/png, image/webp` verified by magic bytes as well as declared type; size ≤ `EVIDENCE_MAX_BYTES` (default 5 MiB); server-generated storage key (never the client filename); SHA-256 recorded. A rejection writes only an audit `EVIDENCE_REJECTED` row.
+  - `attach(db, actor, complaint_id, upload)`: owner or OPERATOR/ADMIN; ≤ `EVIDENCE_MAX_PER_CASE` (default 5) attached per case; key `evidence/{complaint_id}/{uuid}.{ext}`; row `status=ATTACHED`; `EVIDENCE_ADDED` event (non-progress); audit.
+  - `stage(db, actor, conversation_id, upload)`: **the chat path (D16)**, for files attached before a case exists. The conversation must belong to the actor. Same validation; ≤ `EVIDENCE_MAX_PER_CASE` staged per conversation; key `evidence/staged/{conversation_id}/{uuid}.{ext}`; row `status=STAGED`, `complaint_id=NULL`, `conversation_id` set, `expires_at = now + EVIDENCE_STAGING_TTL_HOURS` (default 24). Returns the evidence ID that the composer later sends as `attachment_ids`.
+  - `validate_attachment_ids(db, actor, conversation_id, ids)`: called by the conversations API on every message. Each ID must exist, be `STAGED`, belong to the actor and this conversation, and be unexpired; otherwise 400 `VALIDATION_ERROR` naming the offending ID and nothing is sent to the agent. Valid IDs are recorded on the message metadata.
+  - `bind_staged(db, complaint, conversation_id)`: called by `ComplaintService.create_complaint` when the agent's `create_case` tool succeeds, and by the `ADD_INFORMATION` path when the conversation already has an active case. Every `STAGED` row on the conversation becomes `ATTACHED` to the complaint (`complaint_id` set, `attached_at` set, storage object moved under the case key, `expires_at` cleared), with one `EVIDENCE_ADDED` event per file. Staging is per conversation rather than per message, so a file attached to the first message survives any number of clarification turns until the case is created. The per-case cap is enforced at bind time; overflow files stay staged and the reply states how many were attached.
+  - `get(db, actor, evidence_id)`: `ATTACHED` → same visibility as the case (A11 for files); `STAGED` → the uploader, OPERATOR, and ADMIN only.
+- Worker `evidence_janitor.run()` (added to the scheduler tick): deletes `STAGED` rows past `expires_at` together with their storage objects; audited as SERVICE.
+- Agent context (slice 3's `context.py`): "The citizen has attached N image(s) to this conversation" as text. Image bytes are not sent to the model in MVP; vision-based extraction is a documented follow-up. The model never supplies attachment IDs; binding is done by the server from the conversation's staged rows.
+- API: `POST /api/v1/conversations/{id}/evidence` (multipart, field `file`; CITIZEN owner) → staged evidence; `POST /api/v1/complaints/{id}/evidence` (multipart; owner or OPERATOR/ADMIN) → attached evidence; `GET /api/v1/evidence/{id}` (streams the object with `Content-Disposition: inline`, correct MIME, `Cache-Control: private`). Errors: `VALIDATION_ERROR` for type/size/count/invalid attachment ID, `STORAGE_FAILURE` (503) if the backend write fails, with no `evidence` row written.
+- Frontend: `EvidenceUploader` in the chat composer attachment action (uploads on selection to the conversation endpoint, shows thumbnails as removable chips, sends their IDs as `attachment_ids` with the next message, and keeps the chips across clarification turns until the server reports they were bound) and on both case views (citizen: own case only; operator: any). Client-side pre-checks for size/type mirror the server rules but the server remains authoritative. Evidence section on case detail with thumbnails and alt text derived from the case title (§10 accessibility). The `CaseConfirmationCard` shows how many attachments were bound to the new case.
 - Seed: A1026 gets one generated placeholder PNG (drawn at seed time with Pillow, no binary committed).
 
 ### Notifications (F21)
@@ -66,7 +74,7 @@ Close the remaining P1 features (evidence, notifications), apply the security co
 ### Demo and deployment (§25, §26, §32, Appendix G)
 
 - `scripts/demo_reset.sh`: resets the database, reseeds, runs one worker tick, prints the reference table and the persona login hints. `make demo` wraps it.
-- `frontend/e2e/demo-path.spec.ts` (Playwright, Chromium, fixture LLM mode, mock adapter): logs in as Hamza → sends the Roman Urdu message → answers the location → asserts the case card → opens the trace → logs in as Sara → opens A1024 → sees stalled + recommendation → approves → asserts `ESCALATED` and the confirmed external reference in the timeline → logs back in as Hamza → sends "Streetlight phir band hai" with the location → asserts the related-case card names A1024. Runs in CI against the compose stack. This is the §25 "E2E critical path" and the "demo regression".
+- `frontend/e2e/demo-path.spec.ts` (Playwright, Chromium, fixture LLM mode, mock adapter): logs in as Hamza → attaches one image → sends the Roman Urdu message → answers the location → asserts the case card shows one attachment → opens the trace → logs in as Sara → opens A1024 → sees stalled + recommendation → approves → asserts `ESCALATED` and the confirmed external reference in the timeline → logs back in as Hamza → sends "Streetlight phir band hai" with the location → asserts the related-case card names A1024. Runs in CI against the compose stack. This is the §25 "E2E critical path" and the "demo regression".
 - `docs/demo-runbook.md`: Scenes 1–8 with the exact text to type, the expected screen after each step, timing notes, the environment toggles (`AWWAZ_LLM_MODE`, `CIVIC_MOCK_MODE`, `STALL_THRESHOLD_HOURS`), and the Appendix G backup decision tree (model fails → fixture; adapter fails → show the failed state truthfully; DB fails → static snapshot and say so; network fails → local build).
 - `docs/deployment.md`: §26 order (database → backend → `/ready` → seed → frontend → E2E), env var table from §27 with the D1 rename, split-deployment CORS notes, and a "do not enable in production" list (`AWWAZ_DEMO_MODE`, `run-worker`, `demo/reset`).
 - `README.md` final pass: positioning statements from §36, architecture diagram from §8, quick start, runbook link.
@@ -78,9 +86,12 @@ Real S3 wiring (interface ready), email/SMS/WhatsApp, map, Urdu script UI, voice
 ## Persistence (revision `0006_evidence_notifications`)
 
 ```text
-evidence          id UUID PK, complaint_id FK, storage_key TEXT UNIQUE, original_name VARCHAR, mime_type, size_bytes INT,
-                  sha256 VARCHAR, uploaded_by FK users, created_at
-                  index (complaint_id)
+evidence          id UUID PK, complaint_id FK NULL, conversation_id FK NULL, status (STAGED|ATTACHED), storage_key TEXT UNIQUE,
+                  original_name VARCHAR, mime_type, size_bytes INT, sha256 VARCHAR, uploaded_by FK users,
+                  expires_at TIMESTAMPTZ NULL, created_at, attached_at NULL
+                  CHECK ((status = 'ATTACHED' AND complaint_id IS NOT NULL)
+                      OR (status = 'STAGED' AND conversation_id IS NOT NULL AND expires_at IS NOT NULL))
+                  index (complaint_id), (conversation_id, status), (status, expires_at)
 notifications     id UUID PK, user_id FK users, type, title, body TEXT, complaint_id FK NULL, read_at NULL, created_at
                   index (user_id, read_at, created_at)
 ```
@@ -89,12 +100,14 @@ notifications     id UUID PK, user_id FK users, type, title, body TEXT, complain
 
 - Upload validation happens entirely before any storage or database write; a rejected upload leaves no trace except an audit `EVIDENCE_REJECTED` row.
 - Evidence visibility equals case visibility. There is no unauthenticated download URL.
+- Staged evidence is visible only to its uploader and operators, expires after 24 h if never bound, and is bound to a case only by the server from the conversation's staged rows, never from an ID the model supplies.
 - Rate limits are enforced server-side; the UI's disabled states are conveniences.
 - The E2E test uses fixture mode so CI never needs a model key, and the trace visibly says so.
 
 ## Tests
 
-- Evidence: valid PNG/JPEG/WebP accepted with correct SHA-256 and storage key format; declared `image/png` with non-PNG bytes rejected; 6th file rejected; citizen uploading to another citizen's case → 404; operator download of any case works; storage failure → 503 `STORAGE_FAILURE` and no row.
+- Evidence (case path): valid PNG/JPEG/WebP accepted with correct SHA-256 and storage key format; declared `image/png` with non-PNG bytes rejected; 6th file rejected; citizen uploading to another citizen's case → 404; operator download of any case works; storage failure → 503 `STORAGE_FAILURE` and no row.
+- Evidence (chat path, fixture LLM): stage two images on a conversation → send the Roman Urdu message → clarification → send the location → the created case has both files `ATTACHED`, two `EVIDENCE_ADDED` events, storage keys moved under the case, `expires_at` cleared. Another citizen's staged ID in `attachment_ids` → 400 naming the ID and no agent run. Expired staged ID → 400. Sixth staged file on one conversation → 400. `STAGED` file: uploader and operator can GET, another citizen → 404. Janitor deletes expired staged rows and objects and leaves unexpired ones.
 - Notifications: each trigger creates the expected rows for the expected users; citizen wording never includes operator names; read/unread transitions; a user cannot read another user's notifications.
 - Rate limit: bucket refill timing; 429 body and `Retry-After`; limits keyed per actor, not global.
 - Security matrix (listed above) passes in full.
@@ -111,6 +124,7 @@ notifications     id UUID PK, user_id FK users, type, title, body TEXT, complain
 - [ ] Keyboard-only walkthrough of chat → case → approval works; screen reader announces mutation results.
 - [ ] Bell shows notifications for the citizen after a status change and for the operator after a recommendation.
 - [ ] Evidence upload works from chat and case detail; invalid files show the actionable error.
+- [ ] An image attached in chat before the case exists is bound to the created case and visible on the case detail; staged files left behind are cleaned up by the janitor.
 - [ ] `/admin` shows configuration, users, and audit log read-only.
 - [ ] Appendix I checklist fully ticked in `docs/slices/README.md`.
 - [ ] `make check` green; CI green.
